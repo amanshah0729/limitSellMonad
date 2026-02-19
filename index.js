@@ -1,13 +1,29 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 
-// ── Config ──────────────────────────────────────────────────────────
-const TARGET_SYMBOL = "TCG";
-const ENTRY_PRICE = 0.000374572087361472;
-const SELL_MULTIPLIER = 2.5;
-const SELL_PRICE = ENTRY_PRICE * SELL_MULTIPLIER;
-const STOP_LOSS_PCT = 0.20; // 20% drop from entry = sell
-const STOP_LOSS_PRICE = ENTRY_PRICE * (1 - STOP_LOSS_PCT);
+// ── Tokens to track ─────────────────────────────────────────────────
+const TOKENS = [
+  {
+    symbol: "TCG",
+    entryPrice: 0.000374572087361472,
+    takeProfitX: 2.5,
+    stopLossPct: 0.20,
+    sold: false,
+  },
+  {
+    symbol: "MONA",
+    entryPrice: 0.000070248768223832,
+    takeProfitX: 5,
+    stopLossPct: 0.20,
+    sold: false,
+  },
+];
+
+for (const t of TOKENS) {
+  t.takeProfitPrice = t.entryPrice * t.takeProfitX;
+  t.stopLossPrice = t.entryPrice * (1 - t.stopLossPct);
+}
+
 const SLIPPAGE_BPS = 100; // 1%
 const POLL_MS = 7000;
 const MAX_SELL_RETRIES = 3;
@@ -67,9 +83,11 @@ const dexRouter = new ethers.Contract(DEX_ROUTER, ROUTER_ABI, wallet);
 log(`Bot started`);
 log(`Wallet: ${wallet.address}`);
 log(`RPC: ${process.env.RPC_URL}`);
-log(`Take profit: sell all ${TARGET_SYMBOL} when price >= $${SELL_PRICE.toFixed(12)} (${SELL_MULTIPLIER}x)`);
-log(`Stop loss:   sell all ${TARGET_SYMBOL} when price <= $${STOP_LOSS_PRICE.toFixed(12)} (-${STOP_LOSS_PCT * 100}%)`);
-log(`Polling every ${POLL_MS / 1000}s...`);
+log(`Polling every ${POLL_MS / 1000}s`);
+log(``);
+for (const t of TOKENS) {
+  log(`${t.symbol}: entry $${t.entryPrice} | TP ${t.takeProfitX}x @ $${t.takeProfitPrice.toFixed(12)} | SL -${t.stopLossPct * 100}% @ $${t.stopLossPrice.toFixed(12)}`);
+}
 log(``);
 
 // ── API polling ─────────────────────────────────────────────────────
@@ -89,7 +107,6 @@ const USER_AGENTS = [
 ];
 
 let uaIndex = 0;
-let sold = false;
 let consecutiveErrors = 0;
 
 function getHeaders() {
@@ -111,49 +128,48 @@ function getHeaders() {
 }
 
 // ── Sell logic ──────────────────────────────────────────────────────
-async function executeSell(tokenAddress, reason) {
-  log(`SELL TRIGGERED — reason: ${reason}`);
-  log(`Executing on-chain sell...`);
+async function executeSell(tokenAddress, symbolLabel, reason) {
+  log(`[${symbolLabel}] SELL TRIGGERED — reason: ${reason}`);
+  log(`[${symbolLabel}] Executing on-chain sell...`);
 
   for (let attempt = 1; attempt <= MAX_SELL_RETRIES; attempt++) {
     try {
-      if (attempt > 1) log(`Sell attempt ${attempt}/${MAX_SELL_RETRIES}...`);
+      if (attempt > 1) log(`[${symbolLabel}] Sell attempt ${attempt}/${MAX_SELL_RETRIES}...`);
 
       const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
       const balance = await token.balanceOf(wallet.address);
 
       if (balance === 0n) {
-        log("No token balance to sell. Stopping.");
-        sold = true;
-        return;
+        log(`[${symbolLabel}] No token balance to sell.`);
+        return true;
       }
 
-      log(`Token balance: ${ethers.formatEther(balance)} ${TARGET_SYMBOL}`);
+      log(`[${symbolLabel}] Token balance: ${ethers.formatEther(balance)}`);
 
-      log("Querying Lens for best route...");
+      log(`[${symbolLabel}] Querying Lens for best route...`);
       const [routerAddr, expectedOut] = await lens.getAmountOut(tokenAddress, balance, false);
       const minOut = (expectedOut * BigInt(10000 - SLIPPAGE_BPS)) / 10000n;
 
       const routerName = routerAddr === BONDING_CURVE_ROUTER ? "BondingCurveRouter" : "DexRouter";
-      log(`Router: ${routerName} (${routerAddr})`);
-      log(`Expected MON out: ${ethers.formatEther(expectedOut)}`);
-      log(`Min MON out (${SLIPPAGE_BPS / 100}% slippage): ${ethers.formatEther(minOut)}`);
+      log(`[${symbolLabel}] Router: ${routerName} (${routerAddr})`);
+      log(`[${symbolLabel}] Expected MON out: ${ethers.formatEther(expectedOut)}`);
+      log(`[${symbolLabel}] Min MON out (${SLIPPAGE_BPS / 100}% slippage): ${ethers.formatEther(minOut)}`);
 
       const currentAllowance = await token.allowance(wallet.address, routerAddr);
       if (currentAllowance < balance) {
-        log("Approving tokens...");
+        log(`[${symbolLabel}] Approving tokens...`);
         const approveTx = await token.approve(routerAddr, balance);
-        log(`Approve tx submitted: ${approveTx.hash}`);
+        log(`[${symbolLabel}] Approve tx submitted: ${approveTx.hash}`);
         const approveReceipt = await approveTx.wait();
-        log(`Approve confirmed in block ${approveReceipt.blockNumber}`);
+        log(`[${symbolLabel}] Approve confirmed in block ${approveReceipt.blockNumber}`);
       } else {
-        log("Allowance sufficient, skipping approve.");
+        log(`[${symbolLabel}] Allowance sufficient, skipping approve.`);
       }
 
       const router = routerAddr === BONDING_CURVE_ROUTER ? bondingRouter : dexRouter;
       const deadline = Math.floor(Date.now() / 1000) + 300;
 
-      log("Submitting sell transaction...");
+      log(`[${symbolLabel}] Submitting sell transaction...`);
       const sellTx = await router.sell({
         amountIn: balance,
         amountOutMin: minOut,
@@ -162,30 +178,34 @@ async function executeSell(tokenAddress, reason) {
         deadline,
       });
 
-      log(`Sell tx submitted: ${sellTx.hash}`);
-      log("Waiting for confirmation...");
+      log(`[${symbolLabel}] Sell tx submitted: ${sellTx.hash}`);
+      log(`[${symbolLabel}] Waiting for confirmation...`);
       const receipt = await sellTx.wait();
-      log(`CONFIRMED in block ${receipt.blockNumber} | gas: ${receipt.gasUsed.toString()}`);
-      log(`SOLD ALL ${TARGET_SYMBOL}. Bot stopping.`);
+      log(`[${symbolLabel}] CONFIRMED in block ${receipt.blockNumber} | gas: ${receipt.gasUsed.toString()}`);
+      log(`[${symbolLabel}] SOLD ALL.`);
 
-      sold = true;
-      return;
+      return true;
     } catch (err) {
-      logError(`Sell attempt ${attempt} failed`, err);
+      logError(`[${symbolLabel}] Sell attempt ${attempt} failed`, err);
       if (attempt < MAX_SELL_RETRIES) {
         const wait = attempt * 2000;
-        log(`Retrying in ${wait / 1000}s...`);
+        log(`[${symbolLabel}] Retrying in ${wait / 1000}s...`);
         await new Promise((r) => setTimeout(r, wait));
       } else {
-        logError(`All ${MAX_SELL_RETRIES} sell attempts failed. Bot will keep trying on next poll.`);
+        logError(`[${symbolLabel}] All ${MAX_SELL_RETRIES} sell attempts failed. Will retry next poll.`);
       }
     }
   }
+  return false;
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
 async function poll() {
-  if (sold) return;
+  const allSold = TOKENS.every((t) => t.sold);
+  if (allSold) {
+    log("All tokens sold. Bot stopping.");
+    process.exit(0);
+  }
 
   try {
     const res = await fetch(API_URL, { headers: getHeaders(), method: "GET" });
@@ -208,29 +228,36 @@ async function poll() {
 
     consecutiveErrors = 0;
 
-    const match = data.tokens.find(
-      (t) => t.token_info.symbol.toUpperCase() === TARGET_SYMBOL.toUpperCase()
-    );
+    for (const tracked of TOKENS) {
+      if (tracked.sold) continue;
 
-    if (!match) {
-      log(`${TARGET_SYMBOL} not in latest trades`);
-      return;
-    }
+      const match = data.tokens.find(
+        (t) => t.token_info.symbol.toUpperCase() === tracked.symbol.toUpperCase()
+      );
 
-    const { token_info, market_info, percent } = match;
-    const price = parseFloat(market_info.price_usd);
-    const pct = (percent >= 0 ? "+" : "") + percent.toFixed(2) + "%";
-    const ratio = (price / ENTRY_PRICE).toFixed(2);
-    let tag = "";
-    if (price >= SELL_PRICE) tag = " <<< TAKE PROFIT";
-    else if (price <= STOP_LOSS_PRICE) tag = " <<< STOP LOSS";
+      if (!match) {
+        log(`${tracked.symbol} not in latest trades`);
+        continue;
+      }
 
-    log(`${token_info.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`);
+      const { token_info, market_info, percent } = match;
+      const price = parseFloat(market_info.price_usd);
+      const pct = (percent >= 0 ? "+" : "") + percent.toFixed(2) + "%";
+      const ratio = (price / tracked.entryPrice).toFixed(2);
 
-    if (price >= SELL_PRICE) {
-      await executeSell(token_info.token_id, `TAKE PROFIT at $${market_info.price_usd} (${ratio}x)`);
-    } else if (price <= STOP_LOSS_PRICE) {
-      await executeSell(token_info.token_id, `STOP LOSS at $${market_info.price_usd} (${ratio}x)`);
+      let tag = "";
+      if (price >= tracked.takeProfitPrice) tag = " <<< TAKE PROFIT";
+      else if (price <= tracked.stopLossPrice) tag = " <<< STOP LOSS";
+
+      log(`${tracked.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`);
+
+      if (price >= tracked.takeProfitPrice) {
+        const ok = await executeSell(token_info.token_id, tracked.symbol, `TAKE PROFIT at $${market_info.price_usd} (${ratio}x)`);
+        if (ok) tracked.sold = true;
+      } else if (price <= tracked.stopLossPrice) {
+        const ok = await executeSell(token_info.token_id, tracked.symbol, `STOP LOSS at $${market_info.price_usd} (${ratio}x)`);
+        if (ok) tracked.sold = true;
+      }
     }
   } catch (err) {
     consecutiveErrors++;
