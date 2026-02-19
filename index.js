@@ -14,14 +14,16 @@ const TOKENS = [
     symbol: "MONA",
     entryPrice: 0.000070248768223832,
     takeProfitX: 5,
-    stopLossPct: 0.20,
+    stopLossPrice: 0.000030994677669209, // 40% drop from $0.0000516577
     sold: false,
   },
 ];
 
 for (const t of TOKENS) {
   t.takeProfitPrice = t.entryPrice * t.takeProfitX;
-  t.stopLossPrice = t.entryPrice * (1 - t.stopLossPct);
+  if (!t.stopLossPrice) {
+    t.stopLossPrice = t.entryPrice * (1 - t.stopLossPct);
+  }
 }
 
 const SLIPPAGE_BPS = 100; // 1%
