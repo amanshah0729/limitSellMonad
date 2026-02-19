@@ -25,7 +25,7 @@ for (const t of TOKENS) {
 }
 
 const SLIPPAGE_BPS = 100; // 1%
-const POLL_MS = 7000;
+const POLL_MS = 10000;
 const MAX_SELL_RETRIES = 3;
 
 // ── Contracts (Monad mainnet) ───────────────────────────────────────
