@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { ethers } from "ethers";
+import { createServer } from "http";
 
 // ── Tokens to track ─────────────────────────────────────────────────
 const TOKENS = [
@@ -275,6 +276,14 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (err) => {
   logError("UNHANDLED REJECTION — bot still running", err);
 });
+
+// ── Health check server for Render ──────────────────────────────────
+const PORT = process.env.PORT || 3000;
+createServer((req, res) => {
+  const active = TOKENS.filter((t) => !t.sold).map((t) => t.symbol);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "running", tracking: active }));
+}).listen(PORT, () => log(`Health check listening on port ${PORT}`));
 
 poll();
 setInterval(poll, POLL_MS);
