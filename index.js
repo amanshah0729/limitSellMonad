@@ -10,6 +10,7 @@ const STOP_LOSS_PCT = 0.20; // 20% drop from entry = sell
 const STOP_LOSS_PRICE = ENTRY_PRICE * (1 - STOP_LOSS_PCT);
 const SLIPPAGE_BPS = 100; // 1%
 const POLL_MS = 7000;
+const MAX_SELL_RETRIES = 3;
 
 // ── Contracts (Monad mainnet) ───────────────────────────────────────
 const LENS_ADDRESS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea";
@@ -30,7 +31,32 @@ const ERC20_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
 
+// ── Logging ─────────────────────────────────────────────────────────
+function ts() {
+  return new Date().toISOString();
+}
+
+function log(msg) {
+  console.log(`[${ts()}] ${msg}`);
+}
+
+function logError(msg, err) {
+  console.error(`[${ts()}] ERROR: ${msg}`);
+  if (err) {
+    console.error(`[${ts()}]   message: ${err.message}`);
+    if (err.code) console.error(`[${ts()}]   code: ${err.code}`);
+    if (err.reason) console.error(`[${ts()}]   reason: ${err.reason}`);
+    if (err.data) console.error(`[${ts()}]   data: ${err.data}`);
+    if (err.transaction?.hash) console.error(`[${ts()}]   tx: ${err.transaction.hash}`);
+  }
+}
+
 // ── Wallet setup ────────────────────────────────────────────────────
+if (!process.env.PRIVATE_KEY || !process.env.RPC_URL) {
+  console.error("FATAL: PRIVATE_KEY and RPC_URL must be set in .env");
+  process.exit(1);
+}
+
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
@@ -38,10 +64,13 @@ const lens = new ethers.Contract(LENS_ADDRESS, LENS_ABI, provider);
 const bondingRouter = new ethers.Contract(BONDING_CURVE_ROUTER, ROUTER_ABI, wallet);
 const dexRouter = new ethers.Contract(DEX_ROUTER, ROUTER_ABI, wallet);
 
-console.log(`Wallet: ${wallet.address}`);
-console.log(`Take profit: sell all ${TARGET_SYMBOL} when price >= $${SELL_PRICE.toFixed(12)} (${SELL_MULTIPLIER}x)`);
-console.log(`Stop loss:   sell all ${TARGET_SYMBOL} when price <= $${STOP_LOSS_PRICE.toFixed(12)} (-${STOP_LOSS_PCT * 100}%)`);
-console.log(`Polling every ${POLL_MS / 1000}s...\n`);
+log(`Bot started`);
+log(`Wallet: ${wallet.address}`);
+log(`RPC: ${process.env.RPC_URL}`);
+log(`Take profit: sell all ${TARGET_SYMBOL} when price >= $${SELL_PRICE.toFixed(12)} (${SELL_MULTIPLIER}x)`);
+log(`Stop loss:   sell all ${TARGET_SYMBOL} when price <= $${STOP_LOSS_PRICE.toFixed(12)} (-${STOP_LOSS_PCT * 100}%)`);
+log(`Polling every ${POLL_MS / 1000}s...`);
+log(``);
 
 // ── API polling ─────────────────────────────────────────────────────
 const API_URL = "https://api.nadapp.net/order/latest_trade?page=1&limit=30&is_nsfw=false";
@@ -61,6 +90,7 @@ const USER_AGENTS = [
 
 let uaIndex = 0;
 let sold = false;
+let consecutiveErrors = 0;
 
 function getHeaders() {
   const ua = USER_AGENTS[uaIndex++ % USER_AGENTS.length];
@@ -81,51 +111,76 @@ function getHeaders() {
 }
 
 // ── Sell logic ──────────────────────────────────────────────────────
-async function executeSell(tokenAddress) {
-  console.log("\n🚨 SELL TRIGGERED — executing on-chain sell...\n");
+async function executeSell(tokenAddress, reason) {
+  log(`SELL TRIGGERED — reason: ${reason}`);
+  log(`Executing on-chain sell...`);
 
-  const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
-  const balance = await token.balanceOf(wallet.address);
+  for (let attempt = 1; attempt <= MAX_SELL_RETRIES; attempt++) {
+    try {
+      if (attempt > 1) log(`Sell attempt ${attempt}/${MAX_SELL_RETRIES}...`);
 
-  if (balance === 0n) {
-    console.log("No token balance to sell.");
-    return;
+      const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
+      const balance = await token.balanceOf(wallet.address);
+
+      if (balance === 0n) {
+        log("No token balance to sell. Stopping.");
+        sold = true;
+        return;
+      }
+
+      log(`Token balance: ${ethers.formatEther(balance)} ${TARGET_SYMBOL}`);
+
+      log("Querying Lens for best route...");
+      const [routerAddr, expectedOut] = await lens.getAmountOut(tokenAddress, balance, false);
+      const minOut = (expectedOut * BigInt(10000 - SLIPPAGE_BPS)) / 10000n;
+
+      const routerName = routerAddr === BONDING_CURVE_ROUTER ? "BondingCurveRouter" : "DexRouter";
+      log(`Router: ${routerName} (${routerAddr})`);
+      log(`Expected MON out: ${ethers.formatEther(expectedOut)}`);
+      log(`Min MON out (${SLIPPAGE_BPS / 100}% slippage): ${ethers.formatEther(minOut)}`);
+
+      const currentAllowance = await token.allowance(wallet.address, routerAddr);
+      if (currentAllowance < balance) {
+        log("Approving tokens...");
+        const approveTx = await token.approve(routerAddr, balance);
+        log(`Approve tx submitted: ${approveTx.hash}`);
+        const approveReceipt = await approveTx.wait();
+        log(`Approve confirmed in block ${approveReceipt.blockNumber}`);
+      } else {
+        log("Allowance sufficient, skipping approve.");
+      }
+
+      const router = routerAddr === BONDING_CURVE_ROUTER ? bondingRouter : dexRouter;
+      const deadline = Math.floor(Date.now() / 1000) + 300;
+
+      log("Submitting sell transaction...");
+      const sellTx = await router.sell({
+        amountIn: balance,
+        amountOutMin: minOut,
+        token: tokenAddress,
+        to: wallet.address,
+        deadline,
+      });
+
+      log(`Sell tx submitted: ${sellTx.hash}`);
+      log("Waiting for confirmation...");
+      const receipt = await sellTx.wait();
+      log(`CONFIRMED in block ${receipt.blockNumber} | gas: ${receipt.gasUsed.toString()}`);
+      log(`SOLD ALL ${TARGET_SYMBOL}. Bot stopping.`);
+
+      sold = true;
+      return;
+    } catch (err) {
+      logError(`Sell attempt ${attempt} failed`, err);
+      if (attempt < MAX_SELL_RETRIES) {
+        const wait = attempt * 2000;
+        log(`Retrying in ${wait / 1000}s...`);
+        await new Promise((r) => setTimeout(r, wait));
+      } else {
+        logError(`All ${MAX_SELL_RETRIES} sell attempts failed. Bot will keep trying on next poll.`);
+      }
+    }
   }
-
-  console.log(`Token balance: ${ethers.formatEther(balance)} ${TARGET_SYMBOL}`);
-
-  const [routerAddr, expectedOut] = await lens.getAmountOut(tokenAddress, balance, false);
-  const minOut = (expectedOut * BigInt(10000 - SLIPPAGE_BPS)) / 10000n;
-
-  console.log(`Expected MON out: ${ethers.formatEther(expectedOut)}`);
-  console.log(`Min MON out (${SLIPPAGE_BPS / 100}% slippage): ${ethers.formatEther(minOut)}`);
-  console.log(`Router: ${routerAddr}`);
-
-  const currentAllowance = await token.allowance(wallet.address, routerAddr);
-  if (currentAllowance < balance) {
-    console.log("Approving tokens...");
-    const approveTx = await token.approve(routerAddr, balance);
-    await approveTx.wait();
-    console.log(`Approved: ${approveTx.hash}`);
-  }
-
-  const router = routerAddr === BONDING_CURVE_ROUTER ? bondingRouter : dexRouter;
-  const deadline = Math.floor(Date.now() / 1000) + 300;
-
-  const sellTx = await router.sell({
-    amountIn: balance,
-    amountOutMin: minOut,
-    token: tokenAddress,
-    to: wallet.address,
-    deadline,
-  });
-
-  console.log(`Sell tx submitted: ${sellTx.hash}`);
-  const receipt = await sellTx.wait();
-  console.log(`Confirmed in block ${receipt.blockNumber}`);
-  console.log("SOLD ALL. Bot stopping.");
-
-  sold = true;
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
@@ -134,22 +189,31 @@ async function poll() {
 
   try {
     const res = await fetch(API_URL, { headers: getHeaders(), method: "GET" });
+
     if (!res.ok) {
-      console.error(`[${ts()}] API ${res.status}`);
+      consecutiveErrors++;
+      logError(`API returned ${res.status} (${consecutiveErrors} consecutive errors)`);
+      if (consecutiveErrors >= 10) {
+        logError("10+ consecutive API errors — check if nad.fun API is down");
+      }
       return;
     }
+
     const data = await res.json();
     if (!data.tokens || !Array.isArray(data.tokens)) {
-      console.error(`[${ts()}] Bad response, retrying...`);
+      consecutiveErrors++;
+      logError(`Unexpected API response shape (${consecutiveErrors} consecutive errors)`);
       return;
     }
+
+    consecutiveErrors = 0;
 
     const match = data.tokens.find(
       (t) => t.token_info.symbol.toUpperCase() === TARGET_SYMBOL.toUpperCase()
     );
 
     if (!match) {
-      console.log(`[${ts()}] ${TARGET_SYMBOL} not in latest trades`);
+      log(`${TARGET_SYMBOL} not in latest trades`);
       return;
     }
 
@@ -161,21 +225,27 @@ async function poll() {
     if (price >= SELL_PRICE) tag = " <<< TAKE PROFIT";
     else if (price <= STOP_LOSS_PRICE) tag = " <<< STOP LOSS";
 
-    console.log(
-      `[${ts()}] ${token_info.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`
-    );
+    log(`${token_info.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`);
 
-    if (price >= SELL_PRICE || price <= STOP_LOSS_PRICE) {
-      await executeSell(token_info.token_id);
+    if (price >= SELL_PRICE) {
+      await executeSell(token_info.token_id, `TAKE PROFIT at $${market_info.price_usd} (${ratio}x)`);
+    } else if (price <= STOP_LOSS_PRICE) {
+      await executeSell(token_info.token_id, `STOP LOSS at $${market_info.price_usd} (${ratio}x)`);
     }
   } catch (err) {
-    console.error(`[${ts()}] Error:`, err.message);
+    consecutiveErrors++;
+    logError(`Poll failed (${consecutiveErrors} consecutive errors)`, err);
   }
 }
 
-function ts() {
-  return new Date().toLocaleTimeString();
-}
+// ── Crash handlers ──────────────────────────────────────────────────
+process.on("uncaughtException", (err) => {
+  logError("UNCAUGHT EXCEPTION — bot still running", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  logError("UNHANDLED REJECTION — bot still running", err);
+});
 
 poll();
 setInterval(poll, POLL_MS);
