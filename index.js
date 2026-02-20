@@ -6,9 +6,20 @@ import { createServer } from "http";
 const TOKENS = [
   {
     symbol: "TCG",
+    label: "TCG-600K",
     entryPrice: 0.000374572087361472,
-    takeProfitX: 2.5,
-    stopLossPct: 0.20,
+    takeProfitPrice: 0.0006, // ~$600k mcap
+    sellPct: 0.30,
+    stopLossPrice: 0.000238681, // -30% from current $0.000340974
+    sold: false,
+  },
+  {
+    symbol: "TCG",
+    label: "TCG-935K",
+    entryPrice: 0.000374572087361472,
+    takeProfitPrice: 0.000935, // ~$935k mcap
+    sellPct: 1.0,
+    stopLossPrice: 0.000238681, // -30% from current $0.000340974
     sold: false,
   },
   {
