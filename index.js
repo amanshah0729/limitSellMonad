@@ -13,18 +13,29 @@ const TOKENS = [
   },
   {
     symbol: "MONA",
+    label: "MONA-400K",
     entryPrice: 0.000070248768223832,
-    takeProfitX: 5,
-    stopLossPrice: 0.000030994677669209, // 40% drop from $0.0000516577
+    takeProfitPrice: 0.0004, // ~$400k mcap
+    sellPct: 0.30,
+    stopLossPrice: 0.000030994677669209,
+    sold: false,
+  },
+  {
+    symbol: "MONA",
+    label: "MONA-900K",
+    entryPrice: 0.000070248768223832,
+    takeProfitPrice: 0.0009, // ~$900k mcap
+    sellPct: 1.0,
+    stopLossPrice: 0.000030994677669209,
     sold: false,
   },
 ];
 
 for (const t of TOKENS) {
-  t.takeProfitPrice = t.entryPrice * t.takeProfitX;
-  if (!t.stopLossPrice) {
-    t.stopLossPrice = t.entryPrice * (1 - t.stopLossPct);
-  }
+  if (!t.label) t.label = t.symbol;
+  if (!t.sellPct) t.sellPct = 1.0;
+  if (!t.takeProfitPrice) t.takeProfitPrice = t.entryPrice * t.takeProfitX;
+  if (!t.stopLossPrice) t.stopLossPrice = t.entryPrice * (1 - t.stopLossPct);
 }
 
 const SLIPPAGE_BPS = 100; // 1%
@@ -89,7 +100,9 @@ log(`RPC: ${process.env.RPC_URL}`);
 log(`Polling every ${POLL_MS / 1000}s`);
 log(``);
 for (const t of TOKENS) {
-  log(`${t.symbol}: entry $${t.entryPrice} | TP ${t.takeProfitX}x @ $${t.takeProfitPrice.toFixed(12)} | SL -${t.stopLossPct * 100}% @ $${t.stopLossPrice.toFixed(12)}`);
+  const tpLabel = t.takeProfitX ? `${t.takeProfitX}x` : `$${t.takeProfitPrice.toFixed(12)}`;
+  const sellLabel = t.sellPct < 1 ? `${(t.sellPct * 100).toFixed(0)}% of bag` : "100% (all)";
+  log(`${t.label}: TP @ ${tpLabel} → sell ${sellLabel} | SL @ $${t.stopLossPrice.toFixed(12)}`);
 }
 log(``);
 
@@ -131,26 +144,31 @@ function getHeaders() {
 }
 
 // ── Sell logic ──────────────────────────────────────────────────────
-async function executeSell(tokenAddress, symbolLabel, reason) {
+async function executeSell(tokenAddress, symbolLabel, reason, sellPct = 1.0) {
   log(`[${symbolLabel}] SELL TRIGGERED — reason: ${reason}`);
-  log(`[${symbolLabel}] Executing on-chain sell...`);
+  log(`[${symbolLabel}] Selling ${(sellPct * 100).toFixed(0)}% of bag...`);
 
   for (let attempt = 1; attempt <= MAX_SELL_RETRIES; attempt++) {
     try {
       if (attempt > 1) log(`[${symbolLabel}] Sell attempt ${attempt}/${MAX_SELL_RETRIES}...`);
 
       const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
-      const balance = await token.balanceOf(wallet.address);
+      const fullBalance = await token.balanceOf(wallet.address);
 
-      if (balance === 0n) {
+      if (fullBalance === 0n) {
         log(`[${symbolLabel}] No token balance to sell.`);
         return true;
       }
 
-      log(`[${symbolLabel}] Token balance: ${ethers.formatEther(balance)}`);
+      const sellAmount = sellPct >= 1.0
+        ? fullBalance
+        : (fullBalance * BigInt(Math.round(sellPct * 10000))) / 10000n;
+
+      log(`[${symbolLabel}] Full balance: ${ethers.formatEther(fullBalance)}`);
+      log(`[${symbolLabel}] Selling: ${ethers.formatEther(sellAmount)} (${(sellPct * 100).toFixed(0)}%)`);
 
       log(`[${symbolLabel}] Querying Lens for best route...`);
-      const [routerAddr, expectedOut] = await lens.getAmountOut(tokenAddress, balance, false);
+      const [routerAddr, expectedOut] = await lens.getAmountOut(tokenAddress, sellAmount, false);
       const minOut = (expectedOut * BigInt(10000 - SLIPPAGE_BPS)) / 10000n;
 
       const routerName = routerAddr === BONDING_CURVE_ROUTER ? "BondingCurveRouter" : "DexRouter";
@@ -159,9 +177,9 @@ async function executeSell(tokenAddress, symbolLabel, reason) {
       log(`[${symbolLabel}] Min MON out (${SLIPPAGE_BPS / 100}% slippage): ${ethers.formatEther(minOut)}`);
 
       const currentAllowance = await token.allowance(wallet.address, routerAddr);
-      if (currentAllowance < balance) {
+      if (currentAllowance < sellAmount) {
         log(`[${symbolLabel}] Approving tokens...`);
-        const approveTx = await token.approve(routerAddr, balance);
+        const approveTx = await token.approve(routerAddr, sellAmount);
         log(`[${symbolLabel}] Approve tx submitted: ${approveTx.hash}`);
         const approveReceipt = await approveTx.wait();
         log(`[${symbolLabel}] Approve confirmed in block ${approveReceipt.blockNumber}`);
@@ -174,7 +192,7 @@ async function executeSell(tokenAddress, symbolLabel, reason) {
 
       log(`[${symbolLabel}] Submitting sell transaction...`);
       const sellTx = await router.sell({
-        amountIn: balance,
+        amountIn: sellAmount,
         amountOutMin: minOut,
         token: tokenAddress,
         to: wallet.address,
@@ -185,7 +203,7 @@ async function executeSell(tokenAddress, symbolLabel, reason) {
       log(`[${symbolLabel}] Waiting for confirmation...`);
       const receipt = await sellTx.wait();
       log(`[${symbolLabel}] CONFIRMED in block ${receipt.blockNumber} | gas: ${receipt.gasUsed.toString()}`);
-      log(`[${symbolLabel}] SOLD ALL.`);
+      log(`[${symbolLabel}] SOLD ${(sellPct * 100).toFixed(0)}% complete.`);
 
       return true;
     } catch (err) {
@@ -231,15 +249,18 @@ async function poll() {
 
     consecutiveErrors = 0;
 
+    const seen = new Set();
     for (const tracked of TOKENS) {
       if (tracked.sold) continue;
 
+      // Only log price once per symbol per poll
       const match = data.tokens.find(
         (t) => t.token_info.symbol.toUpperCase() === tracked.symbol.toUpperCase()
       );
 
       if (!match) {
-        log(`${tracked.symbol} not in latest trades`);
+        if (!seen.has(tracked.symbol)) log(`${tracked.symbol} not in latest trades`);
+        seen.add(tracked.symbol);
         continue;
       }
 
@@ -249,17 +270,24 @@ async function poll() {
       const ratio = (price / tracked.entryPrice).toFixed(2);
 
       let tag = "";
-      if (price >= tracked.takeProfitPrice) tag = " <<< TAKE PROFIT";
-      else if (price <= tracked.stopLossPrice) tag = " <<< STOP LOSS";
+      if (price >= tracked.takeProfitPrice) tag = ` <<< ${tracked.label} TAKE PROFIT`;
+      else if (price <= tracked.stopLossPrice) tag = ` <<< ${tracked.label} STOP LOSS`;
 
-      log(`${tracked.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`);
+      if (!seen.has(tracked.symbol)) {
+        log(`${tracked.symbol} | $${market_info.price_usd} | ${pct} | ${ratio}x${tag}`);
+      }
+      seen.add(tracked.symbol);
 
       if (price >= tracked.takeProfitPrice) {
-        const ok = await executeSell(token_info.token_id, tracked.symbol, `TAKE PROFIT at $${market_info.price_usd} (${ratio}x)`);
+        const ok = await executeSell(token_info.token_id, tracked.label, `TAKE PROFIT at $${market_info.price_usd} (${ratio}x)`, tracked.sellPct);
         if (ok) tracked.sold = true;
       } else if (price <= tracked.stopLossPrice) {
-        const ok = await executeSell(token_info.token_id, tracked.symbol, `STOP LOSS at $${market_info.price_usd} (${ratio}x)`);
-        if (ok) tracked.sold = true;
+        // Stop loss: sell everything regardless of sellPct
+        const ok = await executeSell(token_info.token_id, tracked.label, `STOP LOSS at $${market_info.price_usd} (${ratio}x)`, 1.0);
+        if (ok) {
+          // Mark all entries for this symbol as sold
+          TOKENS.filter((t) => t.symbol === tracked.symbol).forEach((t) => (t.sold = true));
+        }
       }
     }
   } catch (err) {
@@ -280,7 +308,7 @@ process.on("unhandledRejection", (err) => {
 // ── Health check server for Render ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
 createServer((req, res) => {
-  const active = TOKENS.filter((t) => !t.sold).map((t) => t.symbol);
+  const active = TOKENS.filter((t) => !t.sold).map((t) => t.label);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ status: "running", tracking: active }));
 }).listen(PORT, () => log(`Health check listening on port ${PORT}`));
