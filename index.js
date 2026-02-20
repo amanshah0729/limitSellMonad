@@ -13,19 +13,10 @@ const TOKENS = [
   },
   {
     symbol: "MONA",
-    label: "MONA-350K",
-    entryPrice: 0.000070248768223832,
-    takeProfitPrice: 0.00035, // ~$350k mcap
-    sellPct: 0.15,
-    stopLossPrice: 0.00015, // ~$150k mcap
-    sold: false,
-  },
-  {
-    symbol: "MONA",
     label: "MONA-600K",
     entryPrice: 0.000070248768223832,
     takeProfitPrice: 0.0006, // ~$600k mcap
-    sellPct: 0.25,
+    sellPct: 0.40,
     stopLossPrice: 0.00015, // ~$150k mcap
     sold: false,
   },
