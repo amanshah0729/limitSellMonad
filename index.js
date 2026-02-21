@@ -10,7 +10,7 @@ const TOKENS = [
     entryPrice: 0.000374572087361472,
     takeProfitPrice: 0.0006, // ~$600k mcap
     sellPct: 0.30,
-    stopLossPrice: 0.000238681, // -30% from current $0.000340974
+    stopLossPrice: 0.0002, // ~$200k mcap
     sold: false,
   },
   {
@@ -19,7 +19,7 @@ const TOKENS = [
     entryPrice: 0.000374572087361472,
     takeProfitPrice: 0.000935, // ~$935k mcap
     sellPct: 1.0,
-    stopLossPrice: 0.000238681, // -30% from current $0.000340974
+    stopLossPrice: 0.0002, // ~$200k mcap
     sold: false,
   },
   {
@@ -28,7 +28,7 @@ const TOKENS = [
     entryPrice: 0.000070248768223832,
     takeProfitPrice: 0.0006, // ~$600k mcap
     sellPct: 0.40,
-    stopLossPrice: 0.00015, // ~$150k mcap
+    stopLossPrice: 0.00008, // ~$80k mcap
     sold: false,
   },
   {
@@ -37,7 +37,7 @@ const TOKENS = [
     entryPrice: 0.000070248768223832,
     takeProfitPrice: 0.0009, // ~$900k mcap
     sellPct: 1.0,
-    stopLossPrice: 0.00015, // ~$150k mcap
+    stopLossPrice: 0.00008, // ~$80k mcap
     sold: false,
   },
 ];
